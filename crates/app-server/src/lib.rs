@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use axum::extract::State;
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use deepseek_agent::ModelRegistry;
@@ -22,12 +23,60 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::{Mutex, RwLock};
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 
 #[derive(Debug, Clone)]
 pub struct AppServerOptions {
     pub listen: SocketAddr,
     pub config_path: Option<PathBuf>,
+}
+
+/// Generate a cryptographically random bearer token for authenticating
+/// HTTP app-server requests. Printed to stderr at startup so the TUI
+/// (or operator) can connect. If DEEPSEEK_APP_SERVER_TOKEN is set in the
+/// environment, use that instead of generating a new one.
+fn generate_or_load_bearer_token() -> String {
+    if let Ok(env_token) = std::env::var("DEEPSEEK_APP_SERVER_TOKEN") {
+        if !env_token.is_empty() {
+            eprintln!("[app-server] Using token from DEEPSEEK_APP_SERVER_TOKEN");
+            return env_token;
+        }
+    }
+    let mut buf = [0u8; 32];
+    getrandom::fill(&mut buf).expect("failed to generate bearer token");
+    buf.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn require_bearer(
+    headers: &HeaderMap,
+    expected: &str,
+) -> std::result::Result<(), (StatusCode, String)> {
+    let auth = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let provided = auth.strip_prefix("Bearer ").unwrap_or(auth).trim();
+    if provided.is_empty() {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "missing Authorization header".to_string(),
+        ));
+    }
+    // Constant-time comparison — compare all bytes regardless of length
+    // to avoid timing leaks. Pad the shorter with zeros.
+    let expected_bytes = expected.as_bytes();
+    let provided_bytes = provided.as_bytes();
+    let max_len = expected_bytes.len().max(provided_bytes.len());
+    let diff = provided_bytes
+        .iter()
+        .chain(std::iter::repeat(&0))
+        .zip(expected_bytes.iter().chain(std::iter::repeat(&0)))
+        .take(max_len)
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b));
+    if diff != 0 {
+        return Err((StatusCode::UNAUTHORIZED, "invalid bearer token".to_string()));
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -36,6 +85,8 @@ struct AppState {
     config: Arc<RwLock<deepseek_config::ConfigToml>>,
     runtime: Arc<Mutex<Runtime>>,
     registry: ModelRegistry,
+    /// Bearer token required on all non-healthz HTTP endpoints.
+    bearer_token: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +145,28 @@ struct ThreadMessageParams {
 pub async fn run(options: AppServerOptions) -> Result<()> {
     let state = build_state(options.config_path.clone())?;
 
+    // Generate a per-process bearer token and print to stderr.
+    eprintln!("[app-server] Bearer token: {}", state.bearer_token);
+    eprintln!(
+        "[app-server] Pass via header: Authorization: Bearer {}",
+        state.bearer_token
+    );
+
+    let bearer = state.bearer_token.clone();
+    // Restrict CORS to localhost origins only (any port). External websites
+    // should not be able to call the app-server API.
+    let cors = CorsLayer::new()
+        .allow_origin(AllowOrigin::predicate(|origin: &str, _| {
+            origin.starts_with("http://localhost:")
+                || origin.starts_with("http://127.0.0.1:")
+                || origin == "http://localhost"
+                || origin == "http://127.0.0.1"
+                || origin == "http://localhost:3000"
+                || origin == "http://127.0.0.1:3000"
+        }))
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers(["authorization", "content-type"].map(|h| h.parse().unwrap()));
+
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/thread", post(thread_handler))
@@ -102,10 +175,26 @@ pub async fn run(options: AppServerOptions) -> Result<()> {
         .route("/tool", post(tool_handler))
         .route("/jobs", get(jobs_handler))
         .route("/mcp/startup", post(mcp_startup_handler))
-        .layer(CorsLayer::permissive())
-        .with_state(state);
+        .with_state(state)
+        .layer(axum::middleware::from_fn(
+            move |req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| {
+                let expected = bearer.clone();
+                async move {
+                    // Skip auth for /healthz (unauthenticated health check)
+                    if req.uri().path() == "/healthz" {
+                        return next.run(req).await;
+                    }
+                    if let Err((status, msg)) = require_bearer(req.headers(), &expected) {
+                        return (status, Json(json!({"error": msg}))).into_response();
+                    }
+                    next.run(req).await
+                }
+            },
+        ))
+        .layer(cors);
 
     let listener = tokio::net::TcpListener::bind(options.listen).await?;
+    eprintln!("[app-server] Listening on {}", options.listen);
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -294,6 +383,7 @@ fn build_state(config_path: Option<PathBuf>) -> Result<AppState> {
         config: Arc::new(RwLock::new(config)),
         runtime: Arc::new(Mutex::new(runtime)),
         registry,
+        bearer_token: generate_or_load_bearer_token(),
     })
 }
 
@@ -780,4 +870,66 @@ async fn persist_config(state: &AppState, config: deepseek_config::ConfigToml) -
     let mut store = ConfigStore::load(state.config_path.clone())?;
     store.config = config;
     store.save()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bearer_empty_header_returns_401() {
+        let headers = HeaderMap::new();
+        let err = require_bearer(&headers, "testtoken").unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        assert!(err.1.contains("missing"));
+    }
+
+    #[test]
+    fn bearer_wrong_token_returns_401() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer wrongtoken".parse().unwrap());
+        let err = require_bearer(&headers, "correcttoken").unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        assert!(err.1.contains("invalid"));
+    }
+
+    #[test]
+    fn bearer_correct_token_returns_ok() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer mysecrettoken".parse().unwrap());
+        let result = require_bearer(&headers, "mysecrettoken");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn bearer_missing_prefix_still_validates() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "mysecrettoken".parse().unwrap());
+        let result = require_bearer(&headers, "mysecrettoken");
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn bearer_different_length_is_constant_time() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer short".parse().unwrap());
+        let err = require_bearer(&headers, "muchlongertoken123456").unwrap_err();
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn token_env_var_overrides_generation() {
+        std::env::set_var("DEEPSEEK_APP_SERVER_TOKEN", "env-provided-token");
+        let token = generate_or_load_bearer_token();
+        assert_eq!(token, "env-provided-token");
+        std::env::remove_var("DEEPSEEK_APP_SERVER_TOKEN");
+    }
+
+    #[test]
+    fn token_generated_when_env_not_set() {
+        std::env::remove_var("DEEPSEEK_APP_SERVER_TOKEN");
+        let token = generate_or_load_bearer_token();
+        assert_eq!(token.len(), 64); // 32 bytes = 64 hex chars
+        assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+    }
 }
